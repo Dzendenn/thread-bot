@@ -1,7 +1,7 @@
 // Бот: присылаешь ссылку на твит, получаешь тред в Markdown, PDF, Word или Telegraph.
 // Работает целиком на Cloudflare, российский сервер не участвует.
 
-import { parseStatusId, collectThread, FxError } from "./fx.js";
+import { parseStatusId, collectThread, FxError, debugFx } from "./fx.js";
 import { toMarkdown, toHtml, toDocx, toTelegraphNodes, fileBase, title, esc } from "./render.js";
 import { tg, sendDocument, telegraphPage, renderPdf } from "./telegram.js";
 
@@ -38,6 +38,23 @@ export default {
       const update = await request.json();
       ctx.waitUntil(handle(update, env).catch((e) => console.log("handle error", e.stack || e)));
       return new Response("ok");
+    }
+
+    // Служебная страница: /debug?key=WEBHOOK_SECRET&id=ID_твита
+    if (url.pathname === "/debug") {
+      if (!env.WEBHOOK_SECRET || url.searchParams.get("key") !== env.WEBHOOK_SECRET)
+        return new Response("forbidden", { status: 403 });
+      const id = parseStatusId(url.searchParams.get("id") || "");
+      if (!id) return new Response("нужен id", { status: 400 });
+      const raw = await debugFx(id);
+      let collected;
+      try {
+        const t = await collectThread(id, MAX_TWEETS);
+        collected = { count: t.tweets.length, ids: t.tweets.map((x) => x.id), sources: t.sources, truncated: t.truncated, downStopped: t.downStopped };
+      } catch (e) {
+        collected = { error: e.message };
+      }
+      return Response.json({ collected, raw }, { headers: { "content-type": "application/json; charset=utf-8" } });
     }
 
     return new Response("thread-bot работает");
@@ -97,9 +114,10 @@ async function onMessage(msg, env) {
     notes.push(`Собрано ${MAX_TWEETS} твитов, до начала треда не дошли: тред длиннее лимита.`);
   if (thread.brokenAt) notes.push("Один из твитов выше удалён или недоступен, начало треда может не попасть.");
   if (thread.startsAsReplyTo) notes.push(`Тред начинается как ответ @${thread.startsAsReplyTo}.`);
-  const last = thread.tweets[thread.tweets.length - 1];
-  if (thread.tweets.length === 1 && last.replies)
-    notes.push("Нашёлся только один твит. Если тред продолжается ниже, пришлите ссылку на последний твит.");
+  if (thread.downStopped)
+    notes.push("Продолжение ниже не удалось проверить до конца. Если тред длиннее, пришлите ссылку на последний твит.");
+  else if (thread.tweets.length === 1 && thread.tweets[0].replies)
+    notes.push("Продолжения от автора не нашлось. Если тред всё же длиннее, пришлите ссылку на последний твит.");
 
   const preview = thread.tweets[0].text.replace(/\s+/g, " ").slice(0, 200);
   const body =

@@ -1,8 +1,14 @@
 // Получение твитов через бесплатный FxTwitter (api.fxtwitter.com).
-// Тред собирается снизу вверх: от присланного твита к началу,
-// пока автор отвечает сам себе.
+//
+// Порядок сборки треда:
+// 1. /2/thread/{id}: развёрнутый тред одним запросом (основной путь).
+// 2. Если ниже последнего найденного твита продолжения нет,
+//    /2/conversation/{id}: ответы на твит, среди них ищем ответ самого автора.
+// 3. Если выше не хватает твитов, поднимаемся по одному через /2/status/{id}.
+// Все запросы считаются: на бесплатном Cloudflare их не больше 50 на одно действие.
 
 const FX = "https://api.fxtwitter.com";
+const UA = { "User-Agent": "thread-bot/1.1 (personal use)" };
 
 const HOSTS =
   "(?:twitter\\.com|x\\.com|fxtwitter\\.com|fixupx\\.com|vxtwitter\\.com|fixvx\\.com|nitter\\.[a-z.]+)";
@@ -26,20 +32,24 @@ export class FxError extends Error {
   }
 }
 
+// Понимает и старый формат FxTwitter (v1), и новый (v2).
 export function normalize(t) {
-  if (!t) return null;
+  if (!t || t.type === "tombstone" || !t.id) return null;
   const media = t.media || {};
+  const rt = t.replying_to;
+  const replyingTo = typeof rt === "string" ? rt : rt?.screen_name || null;
+  const replyingToStatus = t.replying_to_status ?? (typeof rt === "object" ? rt?.status : null);
   return {
     id: String(t.id),
     url: t.url || `https://x.com/${t.author?.screen_name}/status/${t.id}`,
-    text: t.text || "",
+    text: t.text || t.raw_text?.text || "",
     ts: t.created_timestamp || null,
     author: {
       name: t.author?.name || "",
       handle: t.author?.screen_name || "",
     },
-    replyingTo: t.replying_to || null,
-    replyingToStatus: t.replying_to_status ? String(t.replying_to_status) : null,
+    replyingTo,
+    replyingToStatus: replyingToStatus ? String(replyingToStatus) : null,
     replies: t.replies ?? null,
     photos: (media.photos || []).map((p) => p.url).filter(Boolean),
     videos: (media.videos || [])
@@ -49,61 +59,184 @@ export function normalize(t) {
   };
 }
 
-export async function getTweet(id) {
-  const r = await fetch(`${FX}/status/${id}`, {
-    headers: { "User-Agent": "thread-bot/1.0 (personal use)" },
-  });
-  if (r.status === 404) throw new FxError("not_found", 404);
-  if (!r.ok) throw new FxError(`http_${r.status}`, r.status);
-  let j;
+// Счётчик запросов на одно действие.
+class Budget {
+  constructor(max) {
+    this.left = max;
+  }
+  take() {
+    if (this.left <= 0) return false;
+    this.left--;
+    return true;
+  }
+}
+
+async function fxGet(path, budget) {
+  if (budget && !budget.take()) throw new FxError("budget", 0);
+  const r = await fetch(`${FX}${path}`, { headers: UA });
+  let j = null;
   try {
     j = await r.json();
   } catch {
-    throw new FxError("bad_json", 502);
+    /* пусто */
   }
+  if (r.status === 404) throw new FxError("not_found", 404);
+  if (r.status === 401) throw new FxError("private", 401);
+  if (!r.ok || !j) throw new FxError(`http_${r.status}`, r.status);
+  return j;
+}
+
+// Одиночный твит: сначала v2, при сбое старый v1.
+export async function getTweet(id, budget) {
+  try {
+    const j = await fxGet(`/2/status/${id}`, budget);
+    const t = normalize(j.status || j.tweet);
+    if (t) return t;
+  } catch (e) {
+    if (e.status === 404 || e.status === 401 || e.message === "budget") throw e;
+  }
+  const j = await fxGet(`/status/${id}`, budget);
   if (j.code !== 200 || !j.tweet) throw new FxError(j.message || `code_${j.code}`, j.code);
   return normalize(j.tweet);
 }
 
-// Собирает тред от твита id вверх. max ограничивает число запросов:
-// на бесплатном Cloudflare их не больше 50 за один вызов.
-export async function collectThread(id, max = 40) {
-  const start = await getTweet(id);
-  const handle = start.author.handle.toLowerCase();
-  const chain = [start];
-  let cur = start;
-  let truncated = false;
-  let brokenAt = null;
+function sameAuthor(t, handle) {
+  return t && t.author.handle.toLowerCase() === handle;
+}
 
-  while (
-    cur.replyingToStatus &&
-    cur.replyingTo &&
-    cur.replyingTo.toLowerCase() === handle
-  ) {
-    if (chain.length >= max) {
+export async function collectThread(id, max = 40, budgetMax = 44) {
+  const budget = new Budget(budgetMax);
+  const pool = new Map(); // id -> твит автора
+  let start = null;
+  const sources = [];
+
+  // 1. Развёрнутый тред одним запросом
+  try {
+    const j = await fxGet(`/2/thread/${id}`, budget);
+    start = normalize(j.status);
+    const items = [j.status, ...(Array.isArray(j.thread) ? j.thread : [])].map(normalize).filter(Boolean);
+    if (start) {
+      const h = start.author.handle.toLowerCase();
+      for (const t of items) if (sameAuthor(t, h)) pool.set(t.id, t);
+      sources.push(`thread:${items.length}`);
+    }
+  } catch (e) {
+    if (e.status === 404 || e.status === 401) throw e;
+    sources.push(`thread_fail:${e.message}`);
+  }
+
+  if (!start) {
+    start = await getTweet(id, budget);
+    sources.push("status");
+  }
+  const handle = start.author.handle.toLowerCase();
+  pool.set(start.id, start);
+
+  // дети: родитель -> самый ранний ответ автора самому себе
+  const childOf = () => {
+    const m = new Map();
+    for (const t of pool.values()) {
+      if (!t.replyingToStatus || t.replyingTo?.toLowerCase() !== handle) continue;
+      const prev = m.get(t.replyingToStatus);
+      if (!prev || BigInt(t.id) < BigInt(prev.id)) m.set(t.replyingToStatus, t);
+    }
+    return m;
+  };
+
+  // 2. Вверх от присланного твита
+  const up = [];
+  let cur = start;
+  let brokenAt = null;
+  let truncated = false;
+  while (cur.replyingToStatus && cur.replyingTo?.toLowerCase() === handle) {
+    if (up.length + 1 >= max) {
       truncated = true;
       break;
     }
-    try {
-      cur = await getTweet(cur.replyingToStatus);
-    } catch (e) {
-      brokenAt = cur.replyingToStatus;
-      break;
+    let parent = pool.get(cur.replyingToStatus);
+    if (!parent) {
+      try {
+        parent = await getTweet(cur.replyingToStatus, budget);
+      } catch (e) {
+        if (e.message === "budget") truncated = true;
+        else brokenAt = cur.replyingToStatus;
+        break;
+      }
+      if (!sameAuthor(parent, handle)) break;
+      pool.set(parent.id, parent);
     }
-    chain.push(cur);
+    up.push(parent);
+    cur = parent;
   }
+  up.reverse();
 
-  chain.reverse();
+  // 3. Вниз от присланного твита
+  const down = [];
+  const seen = new Set([start.id, ...up.map((t) => t.id)]);
+  cur = start;
+  let downStopped = null;
+  while (up.length + 1 + down.length < max) {
+    let child = childOf().get(cur.id);
+    if (!child) {
+      // в развёрнутом треде продолжения нет, спрашиваем ответы на этот твит
+      try {
+        const j = await fxGet(`/2/conversation/${cur.id}`, budget);
+        const items = [...(j.thread || []), ...(j.replies || [])].map(normalize).filter(Boolean);
+        for (const t of items) if (sameAuthor(t, handle)) pool.set(t.id, t);
+        sources.push(`conv:${items.length}`);
+      } catch (e) {
+        downStopped = e.message;
+        sources.push(`conv_fail:${e.message}`);
+        break;
+      }
+      child = childOf().get(cur.id);
+    }
+    if (!child || seen.has(child.id)) break;
+    seen.add(child.id);
+    down.push(child);
+    cur = child;
+  }
+  if (up.length + 1 + down.length >= max) truncated = true;
+  if (downStopped === "budget") truncated = true;
+
+  const tweets = [...up, start, ...down];
   return {
     author: start.author,
-    tweets: chain,
+    tweets,
     lastId: start.id,
-    truncated, // упёрлись в лимит, начало треда не достали
-    brokenAt, // промежуточный твит удалён или недоступен
-    // первый твит сам является ответом другому человеку
+    truncated,
+    brokenAt,
+    downStopped: downStopped && downStopped !== "budget" ? downStopped : null,
     startsAsReplyTo:
-      chain[0].replyingTo && chain[0].replyingTo.toLowerCase() !== handle
-        ? chain[0].replyingTo
-        : null,
+      tweets[0].replyingTo && tweets[0].replyingTo.toLowerCase() !== handle ? tweets[0].replyingTo : null,
+    sources,
   };
+}
+
+// Для служебной страницы /debug: что именно вернул FxTwitter.
+export async function debugFx(id) {
+  const out = {};
+  for (const path of [`/2/thread/${id}`, `/2/conversation/${id}`]) {
+    try {
+      const r = await fetch(`${FX}${path}`, { headers: UA });
+      const j = await r.json().catch(() => null);
+      const brief = (t) => {
+        const n = normalize(t);
+        return n
+          ? { id: n.id, by: n.author.handle, re: n.replyingTo, reId: n.replyingToStatus, text: n.text.slice(0, 50) }
+          : { tombstone: t?.reason || true };
+      };
+      out[path] = {
+        http: r.status,
+        keys: j ? Object.keys(j) : null,
+        status: j?.status ? brief(j.status) : null,
+        thread: (j?.thread || []).map(brief),
+        replies: (j?.replies || []).slice(0, 15).map(brief),
+        cursor: j?.cursor || null,
+      };
+    } catch (e) {
+      out[path] = { error: e.message };
+    }
+  }
+  return out;
 }

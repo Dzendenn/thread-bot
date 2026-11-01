@@ -43,12 +43,30 @@ for (let i = 1; i <= 5; i++) {
 
 const sent = [];
 let fxCalls = 0;
+let MODE = "full"; // full: /2/thread отдаёт весь тред; parents: только родителей; broken: /2/thread падает
+const v2 = (t) => ({ ...t, replying_to: t.replying_to ? { screen_name: t.replying_to, status: t.replying_to_status } : null, replying_to_status: undefined });
+const fan = (i, parent) => ({ id: String(9000 + i), url: "u", text: "фанат " + i, author: { name: "Фанат", screen_name: "fan" + i }, replying_to: { screen_name: "ivan_p", status: parent } });
+const ids = Object.keys(tweets).sort();
+function parentsOf(id) { const out = []; let t = tweets[id]; while (t.replying_to_status) { t = tweets[t.replying_to_status]; out.unshift(t); } return out; }
 globalThis.fetch = async (url, init = {}) => {
   url = String(url);
-  if (url.startsWith("https://api.fxtwitter.com/status/")) {
+  if (url.startsWith("https://api.fxtwitter.com/")) {
     fxCalls++;
-    const id = url.split("/").pop();
+    assert.ok(init.headers?.["User-Agent"], "нужен User-Agent");
+    const path = url.slice("https://api.fxtwitter.com".length);
+    const id = path.split("/").pop();
     if (!tweets[id]) return new Response("{}", { status: 404 });
+    if (path.startsWith("/2/thread/")) {
+      if (MODE === "broken") return new Response("err", { status: 500 });
+      const thread = MODE === "full" ? ids.map((k) => v2(tweets[k])) : parentsOf(id).map(v2);
+      return Response.json({ code: 200, status: v2(tweets[id]), thread });
+    }
+    if (path.startsWith("/2/conversation/")) {
+      const child = ids.find((k) => tweets[k].replying_to_status === id);
+      const replies = [fan(1, id), fan(2, id), ...(child ? [v2(tweets[child])] : []), fan(3, id)];
+      return Response.json({ code: 200, status: v2(tweets[id]), thread: [], replies });
+    }
+    if (path.startsWith("/2/status/")) return Response.json({ code: 200, status: v2(tweets[id]) });
     return Response.json({ code: 200, message: "OK", tweet: tweets[id] });
   }
   if (url.startsWith("https://api.telegram.org/")) {
@@ -121,12 +139,12 @@ assert.match(sent.pop().body.text, /Ваш номер в Telegram: 7/);
 
 // ссылка на последний твит
 await call({ message: { message_id: 2, chat: { id: 42 }, from: { id: 42 }, text: "https://x.com/ivan_p/status/1000000000005?s=46" } });
-assert.equal(fxCalls, 5);
 const summary = sent.find((s) => s.method === "editMessageText");
 assert.match(summary.body.text, /Твитов: 5/);
 assert.equal(summary.body.reply_markup.inline_keyboard[0].length, 3);
 assert.ok(kv.has("t:1000000000005"));
 
+const callsAfterCollect = fxCalls;
 // кнопки
 const outDir = "test/out";
 mkdirSync(outDir, { recursive: true });
@@ -142,11 +160,29 @@ for (const fmt of ["md", "docx", "pdf", "tgph"]) {
   writeFileSync(`${outDir}/${doc.body.name}`, doc.body.bytes);
   console.log("ok", fmt, doc.body.name, doc.body.bytes.length, "bytes");
 }
-assert.equal(fxCalls, 5, "кнопки должны брать тред из хранилища, а не скачивать заново");
 
+
+assert.equal(fxCalls, callsAfterCollect, "кнопки должны брать тред из хранилища");
 // без хранилища тред скачивается заново, и это тоже работает
 sent.length = 0;
 await call({ callback_query: { id: "c", from: { id: 42 }, message: { chat: { id: 42 } }, data: "md:1000000000003" } }, { ...env, THREADS: undefined });
 assert.ok(sent.find((s) => s.method === "sendDocument"));
+
+
+// ---- сборка треда в разных режимах ----
+const { collectThread } = await import("../src/fx.js");
+for (const mode of ["full", "parents", "broken"]) {
+  MODE = mode;
+  for (const from of ["1000000000001", "1000000000003", "1000000000005"]) {
+    const t = await collectThread(from, 40);
+    assert.deepEqual(t.tweets.map((x) => x.id), ids, `${mode} from ${from}: ${t.tweets.map((x) => x.id)} ${t.sources}`);
+  }
+  console.log("ok сборка", mode);
+}
+MODE = "parents";
+const short = await collectThread("1000000000001", 3);
+assert.equal(short.tweets.length, 3);
+assert.ok(short.truncated);
+MODE = "full";
 
 console.log("все проверки прошли");
