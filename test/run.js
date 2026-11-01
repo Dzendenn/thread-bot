@@ -45,7 +45,8 @@ const sent = [];
 let fxCalls = 0;
 let MODE = "full"; // full: /2/thread отдаёт весь тред; parents: только родителей; broken: /2/thread падает
 const v2 = (t) => ({ ...t, replying_to: t.replying_to ? { screen_name: t.replying_to, status: t.replying_to_status } : null, replying_to_status: undefined });
-const fan = (i, parent) => ({ id: String(9000 + i), url: "u", text: "фанат " + i, author: { name: "Фанат", screen_name: "fan" + i }, replying_to: { screen_name: "ivan_p", status: parent } });
+const fan = (i, parent) => ({ id: String(9000 + i), url: "u", likes: i * 10, replies: i === 2 ? 1 : 0, text: i === 3 ? "@ivan_p 🔥🔥" : `@ivan_p @x Содержательная реплика номер ${i} с аргументом`, author: { name: "Фанат", screen_name: "fan" + i }, replying_to: { screen_name: "ivan_p", status: parent } });
+const authorAnswer = { id: "8001", url: "u", text: "@fan2 Спасибо, вот уточнение", author: AUTHOR, replying_to: { screen_name: "fan2", status: "9002" } };
 const ids = Object.keys(tweets).sort();
 function parentsOf(id) { const out = []; let t = tweets[id]; while (t.replying_to_status) { t = tweets[t.replying_to_status]; out.unshift(t); } return out; }
 globalThis.fetch = async (url, init = {}) => {
@@ -54,7 +55,10 @@ globalThis.fetch = async (url, init = {}) => {
     fxCalls++;
     assert.ok(init.headers?.["User-Agent"], "нужен User-Agent");
     const path = url.slice("https://api.fxtwitter.com".length);
-    const id = path.split("/").pop();
+    const id = path.split("?")[0].split("/").pop();
+    if (path.startsWith("/2/conversation/900")) {
+      return Response.json({ code: 200, status: fan(+id - 9000, "x"), thread: [], replies: id === "9002" ? [authorAnswer] : [] });
+    }
     if (!tweets[id]) return new Response("{}", { status: 404 });
     if (path.startsWith("/2/thread/")) {
       if (MODE === "broken") return new Response("err", { status: 500 });
@@ -168,6 +172,26 @@ sent.length = 0;
 await call({ callback_query: { id: "c", from: { id: 42 }, message: { chat: { id: 42 } }, data: "md:1000000000003" } }, { ...env, THREADS: undefined });
 assert.ok(sent.find((s) => s.method === "sendDocument"));
 
+
+// ---- обсуждение ----
+sent.length = 0;
+await call({ callback_query: { id: "c", from: { id: 42 }, message: { chat: { id: 42 }, message_id: 555 }, data: "tog:1000000000005:d" } });
+const kb = sent.find((s) => s.method === "editMessageReplyMarkup").body.reply_markup.inline_keyboard;
+assert.equal(kb[0][0].callback_data, "md:1000000000005:d");
+sent.length = 0;
+await call({ callback_query: { id: "c", from: { id: 42 }, message: { chat: { id: 42 } }, data: "md:1000000000005:d" } });
+const dmd = new TextDecoder().decode(sent.find((s) => s.method === "sendDocument").body.bytes);
+assert.match(dmd, /## Обсуждение \(2 лучших/);
+assert.ok(dmd.indexOf("номер 2") < dmd.indexOf("номер 1"), "сортировка по лайкам");
+assert.match(dmd, /\*\*Автор:\*\* Спасибо, вот уточнение/);
+assert.ok(!dmd.includes("🔥"), "пустые реплики отброшены");
+assert.ok(!dmd.includes("@ivan_p @x"), "упоминания в начале убраны");
+for (const fmt of ["docx", "pdf", "tgph"]) {
+  sent.length = 0;
+  await call({ callback_query: { id: "c", from: { id: 42 }, message: { chat: { id: 42 } }, data: `${fmt}:1000000000005:d` } });
+  assert.ok(sent.some((s) => s.method === "sendDocument" || (s.method === "sendMessage" && /telegra/.test(s.body.text))), fmt);
+}
+console.log("ok обсуждение");
 
 // ---- сборка треда в разных режимах ----
 const { collectThread } = await import("../src/fx.js");

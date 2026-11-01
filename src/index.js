@@ -1,7 +1,7 @@
 // Бот: присылаешь ссылку на твит, получаешь тред в Markdown, PDF, Word или Telegraph.
 // Работает целиком на Cloudflare, российский сервер не участвует.
 
-import { parseStatusId, collectThread, FxError, debugFx } from "./fx.js";
+import { parseStatusId, collectThread, collectDiscussion, FxError, Budget, debugFx } from "./fx.js";
 import { toMarkdown, toHtml, toDocx, toTelegraphNodes, fileBase, title, esc } from "./render.js";
 import { tg, sendDocument, telegraphPage, renderPdf } from "./telegram.js";
 
@@ -126,19 +126,28 @@ async function onMessage(msg, env) {
     (notes.length ? `\n\n${esc(notes.join("\n"))}` : "") +
     `\n\nВ каком виде выгрузить?`;
 
-  return edit(env, chatId, waitId, body, {
-    parse_mode: "HTML",
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "Markdown", callback_data: `md:${id}` },
-          { text: "PDF", callback_data: `pdf:${id}` },
-          { text: "Word", callback_data: `docx:${id}` },
-        ],
-        [{ text: "Читать в Telegram", callback_data: `tgph:${id}` }],
+  return edit(env, chatId, waitId, body, { parse_mode: "HTML", reply_markup: keyboard(id, false) });
+}
+
+// withD: выгрузка вместе с обсуждением
+function keyboard(id, withD) {
+  const s = withD ? ":d" : "";
+  const plus = withD ? " + ответы" : "";
+  return {
+    inline_keyboard: [
+      [
+        { text: `Markdown${plus}`, callback_data: `md:${id}${s}` },
+        { text: `PDF${plus}`, callback_data: `pdf:${id}${s}` },
+        { text: `Word${plus}`, callback_data: `docx:${id}${s}` },
       ],
-    },
-  });
+      [{ text: `Читать в Telegram${plus}`, callback_data: `tgph:${id}${s}` }],
+      [
+        withD
+          ? { text: "Без обсуждения", callback_data: `tog:${id}` }
+          : { text: "Добавить обсуждение (ответы)", callback_data: `tog:${id}:d` },
+      ],
+    ],
+  };
 }
 
 async function onCallback(cb, env) {
@@ -146,8 +155,28 @@ async function onCallback(cb, env) {
   if (!allowed(env, cb.from.id) || !chatId) {
     return tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
   }
-  const [fmt, id] = String(cb.data || "").split(":");
-  await tg(env, "answerCallbackQuery", { callback_query_id: cb.id, text: "Готовлю..." });
+  const [fmt, id, flag] = String(cb.data || "").split(":");
+  const withD = flag === "d";
+
+  // переключатель режима: только меняем кнопки
+  if (fmt === "tog") {
+    await tg(env, "answerCallbackQuery", {
+      callback_query_id: cb.id,
+      text: withD ? "Выгрузка вместе с обсуждением" : "Выгрузка только треда",
+    });
+    return tg(env, "editMessageReplyMarkup", {
+      chat_id: chatId,
+      message_id: cb.message.message_id,
+      reply_markup: keyboard(id, withD),
+    });
+  }
+
+  await tg(env, "answerCallbackQuery", {
+    callback_query_id: cb.id,
+    text: withD ? "Собираю тред и обсуждение..." : "Готовлю...",
+  });
+  // внешних запросов на одно действие не больше 50, часть уйдёт на Telegram
+  const budget = new Budget(42);
 
   let thread = null;
   if (env.THREADS) {
@@ -156,13 +185,35 @@ async function onCallback(cb, env) {
   }
   if (!thread) {
     try {
-      thread = await collectThread(id, MAX_TWEETS);
+      thread = await collectThread(id, MAX_TWEETS, budget);
     } catch (e) {
       return tg(env, "sendMessage", { chat_id: chatId, text: fxErrorText(e) });
     }
   }
 
-  const base = fileBase(thread);
+  if (withD) {
+    let disc = null;
+    if (env.THREADS) {
+      const raw = await env.THREADS.get(`d:${id}`);
+      if (raw) disc = JSON.parse(raw);
+    }
+    if (!disc) {
+      disc = await collectDiscussion(thread, budget);
+      if (env.THREADS && !disc.error)
+        await env.THREADS.put(`d:${id}`, JSON.stringify(disc), { expirationTtl: 24 * 3600 });
+    }
+    if (disc.error || !disc.replies.length) {
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: disc.error
+          ? `Обсуждение получить не удалось (${disc.error}), выгружаю только тред.`
+          : "Содержательных ответов не нашлось, выгружаю только тред.",
+      });
+    }
+    thread = { ...thread, discussion: disc };
+  }
+
+  const base = fileBase(thread) + (withD && thread.discussion?.replies?.length ? "_discussion" : "");
   const caption = `${title(thread)}\n${thread.tweets[0].url}`;
 
   try {

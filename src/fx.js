@@ -51,6 +51,7 @@ export function normalize(t) {
     replyingTo,
     replyingToStatus: replyingToStatus ? String(replyingToStatus) : null,
     replies: t.replies ?? null,
+    likes: t.likes ?? 0,
     photos: (media.photos || []).map((p) => p.url).filter(Boolean),
     videos: (media.videos || [])
       .map((v) => ({ url: v.url, thumb: v.thumbnail_url || null }))
@@ -60,7 +61,7 @@ export function normalize(t) {
 }
 
 // Счётчик запросов на одно действие.
-class Budget {
+export class Budget {
   constructor(max) {
     this.left = max;
   }
@@ -104,8 +105,7 @@ function sameAuthor(t, handle) {
   return t && t.author.handle.toLowerCase() === handle;
 }
 
-export async function collectThread(id, max = 40, budgetMax = 44) {
-  const budget = new Budget(budgetMax);
+export async function collectThread(id, max = 40, budget = new Budget(44)) {
   const pool = new Map(); // id -> твит автора
   let start = null;
   const sources = [];
@@ -213,6 +213,78 @@ export async function collectThread(id, max = 40, budgetMax = 44) {
   };
 }
 
+// ---------- Обсуждение ----------
+// Ответы других людей на первый твит треда: лучшие по лайкам,
+// плюс ответы самого автора на эти реплики.
+
+const MENTIONS_RE = /^(?:@\w{1,30}\s+)+/;
+
+export function cleanReply(text) {
+  return String(text || "").replace(MENTIONS_RE, "").trim();
+}
+
+function meaningful(text) {
+  const bare = cleanReply(text)
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/[\p{Extended_Pictographic}\uFE0F\u200D]/gu, "")
+    .trim();
+  return bare.length >= 15;
+}
+
+export async function collectDiscussion(thread, budget, top = 20) {
+  const handle = thread.author.handle.toLowerCase();
+  const rootId = thread.tweets[0].id;
+  const inThread = new Set(thread.tweets.map((t) => t.id));
+
+  let items = [];
+  try {
+    const j = await fxGet(`/2/conversation/${rootId}?ranking_mode=likes`, budget);
+    items = (j.replies || []).map(normalize).filter(Boolean);
+  } catch (e) {
+    return { replies: [], error: e.message, total: 0 };
+  }
+
+  const others = items.filter(
+    (t) => !inThread.has(t.id) && t.author.handle.toLowerCase() !== handle && meaningful(t.text)
+  );
+  // авторские ответы, пришедшие в той же выдаче
+  const authorAnswers = new Map();
+  for (const t of items) {
+    if (t.author.handle.toLowerCase() === handle && !inThread.has(t.id) && t.replyingToStatus) {
+      if (!authorAnswers.has(t.replyingToStatus)) authorAnswers.set(t.replyingToStatus, []);
+      authorAnswers.get(t.replyingToStatus).push(t);
+    }
+  }
+
+  const picked = others.sort((a, b) => (b.likes || 0) - (a.likes || 0)).slice(0, top);
+
+  // для реплик, на которые кто-то отвечал, ищем ответ автора
+  for (const r of picked) {
+    if (authorAnswers.has(r.id) || !r.replies) continue;
+    if (budget.left <= 0) break;
+    try {
+      const j = await fxGet(`/2/conversation/${r.id}`, budget);
+      for (const t of (j.replies || []).map(normalize).filter(Boolean)) {
+        if (t.author.handle.toLowerCase() === handle && t.replyingToStatus === r.id) {
+          if (!authorAnswers.has(r.id)) authorAnswers.set(r.id, []);
+          authorAnswers.get(r.id).push(t);
+        }
+      }
+    } catch {
+      /* пропускаем ветку */
+    }
+  }
+
+  return {
+    total: items.length,
+    replies: picked.map((r) => ({
+      ...r,
+      text: cleanReply(r.text),
+      authorAnswers: (authorAnswers.get(r.id) || []).map((a) => ({ ...a, text: cleanReply(a.text) })),
+    })),
+  };
+}
+
 // Для служебной страницы /debug: что именно вернул FxTwitter.
 export async function debugFx(id) {
   const out = {};
@@ -223,7 +295,7 @@ export async function debugFx(id) {
       const brief = (t) => {
         const n = normalize(t);
         return n
-          ? { id: n.id, by: n.author.handle, re: n.replyingTo, reId: n.replyingToStatus, text: n.text.slice(0, 50) }
+          ? { id: n.id, by: n.author.handle, re: n.replyingTo, reId: n.replyingToStatus, likes: n.likes, replies: n.replies, text: n.text.slice(0, 50) }
           : { tombstone: t?.reason || true };
       };
       out[path] = {

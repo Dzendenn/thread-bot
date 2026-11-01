@@ -7,6 +7,14 @@ const MONTHS = [
   "июля", "августа", "сентября", "октября", "ноября", "декабря",
 ];
 
+export function plural(n, one, few, many) {
+  const a = Math.abs(n) % 100, b = a % 10;
+  const w = a > 10 && a < 20 ? many : b === 1 ? one : b >= 2 && b <= 4 ? few : many;
+  return `${n} ${w}`;
+}
+const likes = (n) => plural(n || 0, "лайк", "лайка", "лайков");
+const best = (n) => `${n} ${n % 10 === 1 && n % 100 !== 11 ? "лучший ответ" : "лучших ответов"} по лайкам`;
+
 export function fmtDate(ts) {
   if (!ts) return "";
   const d = new Date(ts * 1000);
@@ -59,6 +67,17 @@ export function toMarkdown(thread) {
       out.push(`> ${q.url}`, "");
     }
   });
+  if (thread.discussion?.replies?.length) {
+    out.push("---", "", `## Обсуждение (${best(thread.discussion.replies.length)})`, "");
+    for (const r of thread.discussion.replies) {
+      out.push(`**${r.author.name}** @${r.author.handle} · ${likes(r.likes)}`, "");
+      out.push(r.text, "");
+      for (const p of r.photos) out.push(`![](${p})`, "");
+      for (const a of r.authorAnswers) {
+        out.push(`> **Автор:** ${a.text.split("\n").join("\n> ")}`, "");
+      }
+    }
+  }
   return out.join("\n").replace(/\n{3,}/g, "\n\n") + "\n";
 }
 
@@ -76,6 +95,21 @@ function linkify(s) {
   return esc(s)
     .replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1">$1</a>')
     .replace(/\n/g, "<br>");
+}
+
+function discussionHtml(thread) {
+  const d = thread.discussion;
+  if (!d?.replies?.length) return "";
+  const rows = d.replies
+    .map((r) => {
+      const ans = r.authorAnswers
+        .map((a) => `<blockquote class="author"><b>Автор:</b> ${linkify(a.text)}</blockquote>`)
+        .join("");
+      const photos = r.photos.map((p) => `<img src="${esc(p)}">`).join("");
+      return `<div class="reply"><div class="who"><b>${esc(r.author.name)}</b> @${esc(r.author.handle)} · ${likes(r.likes)}</div><p>${linkify(r.text)}</p>${photos}${ans}</div>`;
+    })
+    .join("\n");
+  return `<h2>Обсуждение</h2><div class="meta">${best(d.replies.length)}</div>${rows}`;
 }
 
 export function toHtml(thread) {
@@ -112,11 +146,16 @@ img{max-width:100%;max-height:520px;display:block;margin:8px 0;border-radius:6px
 blockquote{margin:8px 0;padding:8px 12px;border-left:3px solid #bbb;background:#f6f6f6;font-size:11pt}
 a{color:#1d5fa8;text-decoration:none;word-break:break-all}
 .vid{display:block;position:relative}
+h2{font-family:"PT Sans",Arial,sans-serif;font-size:15pt;margin:28px 0 4px}
+.reply{margin:12px 0;padding:0 0 10px 12px;border-left:2px solid #e2e2e2;font-size:11pt}
+.who{font-family:"PT Sans",Arial,sans-serif;font-size:9.5pt;color:#555;margin-bottom:2px}
+blockquote.author{background:#eef4fb;border-left-color:#1d5fa8}
 .vid span{font-family:"PT Sans",Arial,sans-serif;font-size:9pt;color:#666}
 </style></head><body>
 <header><h1>${esc(title(thread))}</h1>
 <div class="meta">${esc(m.who)}${m.date ? " · " + esc(m.date) : ""} · твитов: ${m.count}<br><a href="${esc(m.url)}">${esc(m.url)}</a></div></header>
 ${items}
+${discussionHtml(thread)}
 </body></html>`;
 }
 
@@ -183,6 +222,18 @@ export function toDocx(thread) {
     }
     ps.push(para("", { after: 120 }));
   });
+
+  if (thread.discussion?.replies?.length) {
+    ps.push(para(run("Обсуждение", { bold: true, size: 28 }), { after: 60 }));
+    ps.push(para(run(best(thread.discussion.replies.length), { size: 18, color: "666666" }), { after: 200 }));
+    for (const r of thread.discussion.replies) {
+      ps.push(para(run(`${r.author.name} @${r.author.handle}, ${likes(r.likes)}`, { bold: true, size: 18, color: "555555" }), { after: 20, indent: 240 }));
+      ps.push(para(run(r.text, { size: 21 }), { indent: 240 }));
+      for (const a of r.authorAnswers) {
+        ps.push(para(run("Автор: ", { bold: true, size: 20 }) + run(a.text, { size: 20 }), { indent: 600, shade: "EEF4FB" }));
+      }
+    }
+  }
 
   const document = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${ps.join("")}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134" w:header="709" w:footer="709" w:gutter="0"/></w:sectPr></w:body></w:document>`;
@@ -256,5 +307,17 @@ export function toTelegraphNodes(thread) {
       });
     }
   });
+  if (thread.discussion?.replies?.length) {
+    nodes.push({ tag: "hr" });
+    nodes.push({ tag: "h3", children: ["Обсуждение"] });
+    for (const r of thread.discussion.replies) {
+      nodes.push({
+        tag: "p",
+        children: [{ tag: "b", children: [`${r.author.name} @${r.author.handle}`] }, ` · ${likes(r.likes)}`, { tag: "br" }, ...textNodes(r.text)],
+      });
+      for (const a of r.authorAnswers)
+        nodes.push({ tag: "blockquote", children: [{ tag: "b", children: ["Автор: "] }, ...textNodes(a.text)] });
+    }
+  }
   return nodes;
 }
