@@ -1,0 +1,13 @@
+name = "thread-bot"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+[observability]
+enabled = true
+
+# Хранилище собранных тредов. Без него бот тоже работает,
+# но при каждом нажатии кнопки заново скачивает тред.
+# Когда создадите хранилище, впишите его ID и уберите решётки:
+# [[kv_namespaces]]
+# binding = "THREADS"
+# id = "ВСТАВИТЬ_ID"
