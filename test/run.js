@@ -86,9 +86,12 @@ globalThis.fetch = async (url, init = {}) => {
   if (url.startsWith("https://api.telegra.ph/createAccount"))
     return Response.json({ ok: true, result: { access_token: "TOKEN" } });
   if (url.startsWith("https://api.telegra.ph/createPage")) {
-    const b = JSON.parse(init.body);
-    assert.ok(Array.isArray(b.content) && b.content.length > 5);
-    assert.ok(JSON.stringify(b).length < 64000);
+    if (globalThis.TGPH_FAIL > 0) { globalThis.TGPH_FAIL--; return Response.json({ ok: false, error: "ACCOUNT_NOT_FOUND" }); }
+    const b = Object.fromEntries(new URLSearchParams(String(init.body)));
+    assert.equal(b.access_token, "TOKEN");
+    const content = JSON.parse(b.content);
+    assert.ok(Array.isArray(content) && content.length > 5);
+    assert.ok(b.content.length < 64000);
     return Response.json({ ok: true, result: { url: "https://telegra.ph/test-11-01" } });
   }
   if (url.includes("/browser-rendering/pdf")) {
@@ -192,6 +195,13 @@ for (const fmt of ["docx", "pdf", "tgph"]) {
   assert.ok(sent.some((s) => s.method === "sendDocument" || (s.method === "sendMessage" && /telegra/.test(s.body.text))), fmt);
 }
 console.log("ok обсуждение");
+
+// Telegraph один раз не узнаёт свежий аккаунт, со второй попытки получается
+globalThis.TGPH_FAIL = 1;
+sent.length = 0;
+await call({ callback_query: { id: "c", from: { id: 42 }, message: { chat: { id: 42 } }, data: "tgph:1000000000005" } }, { ...env, THREADS: undefined });
+assert.equal(sent.find((s) => s.method === "sendMessage").body.text, "https://telegra.ph/test-11-01");
+console.log("ok повтор Telegraph");
 
 // ---- сборка треда в разных режимах ----
 const { collectThread } = await import("../src/fx.js");

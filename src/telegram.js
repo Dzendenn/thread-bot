@@ -26,39 +26,58 @@ export async function sendDocument(env, chatId, filename, bytes, mime, caption) 
 }
 
 // Telegraph: страница, которая открывается прямо внутри Telegram.
-async function telegraphToken(env) {
-  if (env.TELEGRAPH_TOKEN) return env.TELEGRAPH_TOKEN;
-  if (env.THREADS) {
-    const saved = await env.THREADS.get("telegraph_token");
-    if (saved) return saved;
-  }
-  const r = await fetch("https://api.telegra.ph/createAccount", {
+// Запросы шлём в документированном виде: поля формы, content строкой JSON.
+async function telegraphCall(method, fields) {
+  const body = new URLSearchParams();
+  for (const [k, v] of Object.entries(fields)) body.set(k, typeof v === "string" ? v : JSON.stringify(v));
+  const r = await fetch(`https://api.telegra.ph/${method}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ short_name: "thread-bot", author_name: "Thread Bot" }),
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body,
   });
-  const j = await r.json();
+  return r.json().catch(() => ({ ok: false, error: `http_${r.status}` }));
+}
+
+async function newTelegraphAccount() {
+  const j = await telegraphCall("createAccount", { short_name: "threadbot", author_name: "Thread Bot" });
   if (!j.ok) throw new Error(`telegraph account: ${j.error}`);
-  if (env.THREADS) await env.THREADS.put("telegraph_token", j.result.access_token);
   return j.result.access_token;
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 export async function telegraphPage(env, title, authorName, authorUrl, nodes) {
-  const token = await telegraphToken(env);
-  const r = await fetch("https://api.telegra.ph/createPage", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      access_token: token,
-      title: title.slice(0, 250),
-      author_name: authorName.slice(0, 128),
-      author_url: authorUrl,
-      content: nodes,
-    }),
-  });
-  const j = await r.json();
-  if (!j.ok) throw new Error(`telegraph page: ${j.error}`);
-  return j.result.url;
+  let token = env.TELEGRAPH_TOKEN || (env.THREADS ? await env.THREADS.get("telegraph_token") : null);
+  let fresh = false;
+  if (!token) {
+    token = await newTelegraphAccount();
+    fresh = true;
+  }
+  const fields = {
+    title: title.slice(0, 250),
+    author_name: authorName.slice(0, 128),
+    author_url: authorUrl,
+    content: nodes,
+  };
+
+  let last = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const j = await telegraphCall("createPage", { access_token: token, ...fields });
+    if (j.ok) {
+      if (fresh && env.THREADS) await env.THREADS.put("telegraph_token", token);
+      return j.result.url;
+    }
+    last = j.error;
+    console.log(`telegraph createPage attempt ${attempt + 1}: ${j.error}`);
+    if (j.error !== "ACCOUNT_NOT_FOUND" && j.error !== "ACCESS_TOKEN_INVALID") break;
+    // свежий аккаунт иногда не успевает появиться: ждём; сохранённый ключ мог устареть: создаём новый
+    if (fresh) await sleep(1500 * (attempt + 1));
+    else {
+      token = await newTelegraphAccount();
+      fresh = true;
+    }
+  }
+  throw new Error(`telegraph page: ${last}`);
 }
 
 // PDF через встроенный браузер Cloudflare (бесплатно 10 минут в сутки).
